@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/streams"
@@ -19,13 +22,20 @@ import (
 
 var log zerolog.Logger
 
-// callEntry tracks an active SIP call for BYE handling.
+// Module-level SIP stack shared by server and client.
+var (
+	ua            *sipgo.UserAgent
+	sipClient     *sipgo.Client
+	clientDialogs *sipgo.DialogClientCache
+)
+
+// callEntry tracks an active server-side SIP session (phone calling us).
 type callEntry struct {
 	stream *streams.Stream
 	conn   *Conn
 }
 
-// calls maps SIP Call-ID -> *callEntry.
+// calls maps SIP Call-ID → *callEntry for server-side sessions.
 var calls sync.Map
 
 func Init() {
@@ -44,6 +54,30 @@ func Init() {
 
 	log = app.GetLogger("sip")
 
+	// Create the shared User Agent used for both server and client.
+	var err error
+	ua, err = sipgo.NewUA(sipgo.WithUserAgent(app.UserAgent))
+	if err != nil {
+		log.Error().Err(err).Msg("[sip] new UA")
+		return
+	}
+
+	sipClient, err = sipgo.NewClient(ua)
+	if err != nil {
+		log.Error().Err(err).Msg("[sip] new client")
+		return
+	}
+
+	// The Contact host is intentionally left empty; sipgo fills it in from
+	// the Via header at send time so we always advertise the correct address.
+	contactHDR := sipmsg.ContactHeader{
+		Address: sipmsg.Uri{Scheme: "sip"},
+	}
+	clientDialogs = sipgo.NewDialogClientCache(sipClient, contactHDR)
+
+	// Register handler so streams can use  sip://user:pass@pbx/callee  as a source.
+	streams.HandleFunc("sip", sipProducerHandler)
+
 	if conf.Mod.Listen == "" {
 		return
 	}
@@ -51,13 +85,9 @@ func Init() {
 	go runServer(conf.Mod.Listen)
 }
 
-func runServer(listen string) {
-	ua, err := sipgo.NewUA(sipgo.WithUserAgent(app.UserAgent))
-	if err != nil {
-		log.Error().Err(err).Msg("[sip] new UA")
-		return
-	}
+// ─── Server (UAS) ──────────────────────────────────────────────────────────────
 
+func runServer(listen string) {
 	srv, err := sipgo.NewServer(ua)
 	if err != nil {
 		log.Error().Err(err).Msg("[sip] new server")
@@ -81,7 +111,6 @@ func runServer(listen string) {
 }
 
 func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-	// Send 100 Trying immediately to stop retransmissions.
 	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 100, "Trying", nil))
 
 	// Derive stream name from the request URI user part, e.g. sip:doorbell@host → "doorbell".
@@ -103,10 +132,9 @@ func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 		return
 	}
 
-	// Determine our local IP towards the caller for RTP binding.
 	localIP := outboundIP(req.Source())
 
-	conn, err := newConn(offerBody, localIP)
+	conn, err := newServerConn(offerBody, localIP)
 	if err != nil {
 		log.Error().Err(err).Msg("[sip] create conn")
 		_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 500, "Internal Server Error", nil))
@@ -143,62 +171,216 @@ func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 		log.Error().Err(err).Msg("[sip] respond 200 OK")
 	}
 
-	log.Info().Str("call_id", callID).Str("stream", streamName).Msg("[sip] call started")
+	log.Info().Str("call_id", callID).Str("stream", streamName).Msg("[sip] incoming call")
 }
 
 func handleBye(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-	callID := ""
-	if cid := req.CallID(); cid != nil {
-		callID = string(*cid)
+	// First, check if this BYE belongs to an outgoing (client) dialog.
+	if clientDialogs != nil {
+		if err := clientDialogs.ReadBye(req, tx); err == nil {
+			log.Info().Str("call_id", byeCallID(req)).Msg("[sip] outgoing call ended (BYE)")
+			return
+		}
 	}
 
+	// Otherwise, handle as incoming (server) dialog.
+	callID := byeCallID(req)
 	if v, ok := calls.LoadAndDelete(callID); ok {
 		entry := v.(*callEntry)
 		entry.stream.RemoveConsumer(entry.conn)
-		log.Info().Str("call_id", callID).Msg("[sip] call ended (BYE)")
+		log.Info().Str("call_id", callID).Msg("[sip] incoming call ended (BYE)")
 	}
 
 	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 200, "OK", nil))
 }
 
-// outboundIP returns the local IP that would be used to reach remoteAddr.
-// This is needed to advertise the correct IP in the SDP answer.
-func outboundIP(remoteAddr string) net.IP {
-	host, _, _ := net.SplitHostPort(remoteAddr)
-	if host == "" {
-		return net.IPv4zero
+func byeCallID(req *sipmsg.Request) string {
+	if cid := req.CallID(); cid != nil {
+		return string(*cid)
 	}
-	// Dial UDP (no packets sent) to discover the outbound interface.
-	conn, err := net.Dial("udp", net.JoinHostPort(host, "1"))
-	if err != nil {
-		return net.IPv4zero
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP
+	return ""
 }
 
-// Conn is a SIP media session bridging the SIP peer and a go2rtc stream.
+// ─── Client (UAC) ──────────────────────────────────────────────────────────────
+
+// sipProducerHandler is called by the streams engine when a sip:// URL is used
+// as a source.
 //
-// It implements core.Consumer so go2rtc pushes the stream's audio out to
-// the SIP peer via RTP.  When two-way audio is negotiated it also implements
-// core.Producer so RTP arriving from the SIP peer is injected back into the
-// stream as backchannel audio (e.g. to the doorbell speaker).
-type Conn struct {
-	core.Connection
-
-	udpConn    *net.UDPConn
-	remoteAddr *net.UDPAddr
-	codec      *core.Codec
-	backRecv   *core.Receiver
-}
-
-func newConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
-	var sd sdp.SessionDescription
-	if err := sd.Unmarshal(offerSDP); err != nil {
-		return nil, fmt.Errorf("unmarshal offer SDP: %w", err)
+// URL format:  sip://username:password@pbx-host:5060/callee
+//
+//   - username / password  are credentials for digest authentication with the PBX.
+//   - pbx-host:port        is the PBX address (port defaults to 5060).
+//   - callee               is the extension being called (path after the host).
+//     If omitted, username is used as the callee.
+func sipProducerHandler(rawURL string) (core.Producer, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse SIP URL: %w", err)
 	}
 
-	// Locate the audio media section.
+	username := u.User.Username()
+	password, _ := u.User.Password()
+
+	pbxHost := u.Host
+	if pbxHost == "" {
+		return nil, fmt.Errorf("SIP URL missing host: %s", rawURL)
+	}
+
+	// Resolve host and port separately; default to 5060.
+	pbxIP, pbxPortStr, err := net.SplitHostPort(pbxHost)
+	if err != nil {
+		pbxIP = pbxHost
+		pbxPortStr = "5060"
+	}
+	pbxPort, _ := strconv.Atoi(pbxPortStr)
+
+	callee := strings.TrimPrefix(u.Path, "/")
+	if callee == "" {
+		callee = username
+	}
+	if callee == "" {
+		return nil, fmt.Errorf("SIP URL missing callee (path): %s", rawURL)
+	}
+
+	// Determine which local IP faces the PBX.
+	localIP := outboundIP(net.JoinHostPort(pbxIP, pbxPortStr))
+
+	// Bind a UDP socket now so we know our RTP port before sending the offer.
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("bind RTP socket: %w", err)
+	}
+
+	localPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+	offerSDP := buildOfferSDP(localIP, localPort)
+
+	recipient := sipmsg.Uri{
+		Scheme: "sip",
+		User:   callee,
+		Host:   pbxIP,
+		Port:   pbxPort,
+	}
+
+	ct := sipmsg.ContentTypeHeader("application/sdp")
+
+	// Dial with a 30-second timeout so the caller's reconnect timer doesn't fire
+	// before we know whether the PBX answered.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dialog, err := clientDialogs.Invite(ctx, recipient, offerSDP, &ct)
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("INVITE: %w", err)
+	}
+
+	if err := dialog.WaitAnswer(ctx, sipgo.AnswerOptions{
+		Username: username,
+		Password: password,
+	}); err != nil {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("wait answer: %w", err)
+	}
+
+	if err := dialog.Ack(ctx); err != nil {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("ACK: %w", err)
+	}
+
+	// Parse the answer SDP to learn the PBX's chosen codec and RTP address.
+	answerBody := dialog.InviteResponse.Body()
+	if len(answerBody) == 0 {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("empty answer SDP")
+	}
+
+	remoteAddr, codec, err := parseAudioAddr(answerBody)
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("answer SDP: %w", err)
+	}
+
+	conn := &ClientConn{
+		udpConn:    udpConn,
+		remoteAddr: remoteAddr,
+		codec:      codec,
+		dialog:     dialog,
+	}
+	conn.ID = core.NewID()
+	conn.FormatName = "sip"
+	conn.Protocol = "udp"
+	conn.Source = rawURL
+	conn.RemoteAddr = remoteAddr.String()
+	// Transport lets core.Connection.Stop() close the socket.
+	conn.Transport = udpConn
+
+	// From the producer perspective:
+	//   recvonly – PBX sends us audio; we provide it to downstream consumers.
+	//   sendonly – we accept audio from consumers and forward it to the PBX.
+	conn.Medias = []*core.Media{
+		{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec}},
+		{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{codec}},
+	}
+
+	log.Info().
+		Str("callee", callee).
+		Str("codec", codec.Name).
+		Str("remote_rtp", remoteAddr.String()).
+		Msg("[sip] outgoing call established")
+
+	return conn, nil
+}
+
+// buildOfferSDP creates an SDP offer advertising both PCMU (PT 0) and PCMA (PT 8).
+// The PBX picks one; we handle either in the answer.
+func buildOfferSDP(localIP net.IP, localPort int) []byte {
+	ipStr := "0.0.0.0"
+	if localIP != nil && !localIP.IsUnspecified() {
+		ipStr = localIP.String()
+	}
+
+	sd := sdp.SessionDescription{
+		Origin: sdp.Origin{
+			Username:       "-",
+			SessionID:      1,
+			SessionVersion: 1,
+			NetworkType:    "IN",
+			AddressType:    "IP4",
+			UnicastAddress: ipStr,
+		},
+		SessionName: "go2rtc",
+		ConnectionInformation: &sdp.ConnectionInformation{
+			NetworkType: "IN",
+			AddressType: "IP4",
+			Address:     &sdp.Address{Address: ipStr},
+		},
+		TimeDescriptions: []sdp.TimeDescription{{Timing: sdp.Timing{}}},
+		MediaDescriptions: []*sdp.MediaDescription{{
+			MediaName: sdp.MediaName{
+				Media:   "audio",
+				Port:    sdp.RangedPort{Value: localPort},
+				Protos:  []string{"RTP", "AVP"},
+				Formats: []string{"0", "8"},
+			},
+			Attributes: []sdp.Attribute{
+				{Key: "rtpmap", Value: "0 PCMU/8000"},
+				{Key: "rtpmap", Value: "8 PCMA/8000"},
+				{Key: "sendrecv"},
+			},
+		}},
+	}
+
+	b, _ := sd.Marshal()
+	return b
+}
+
+// parseAudioAddr extracts the remote RTP address and chosen codec from an SDP body.
+func parseAudioAddr(body []byte) (*net.UDPAddr, *core.Codec, error) {
+	var sd sdp.SessionDescription
+	if err := sd.Unmarshal(body); err != nil {
+		return nil, nil, fmt.Errorf("unmarshal: %w", err)
+	}
+
 	var audioMD *sdp.MediaDescription
 	for _, md := range sd.MediaDescriptions {
 		if md.MediaName.Media == "audio" {
@@ -207,10 +389,9 @@ func newConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 		}
 	}
 	if audioMD == nil {
-		return nil, fmt.Errorf("no audio media in SDP offer")
+		return nil, nil, fmt.Errorf("no audio media")
 	}
 
-	// Remote IP: media-level c= overrides session-level c=.
 	remoteIP := ""
 	if sd.ConnectionInformation != nil && sd.ConnectionInformation.Address != nil {
 		remoteIP = sd.ConnectionInformation.Address.Address
@@ -219,9 +400,6 @@ func newConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 		remoteIP = audioMD.ConnectionInformation.Address.Address
 	}
 
-	remotePort := audioMD.MediaName.Port.Value
-
-	// Select first PCMA or PCMU codec offered (telephony standard codecs).
 	var codec *core.Codec
 	for _, format := range audioMD.MediaName.Formats {
 		c := core.UnmarshalCodec(audioMD, format)
@@ -231,15 +409,127 @@ func newConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 		}
 	}
 	if codec == nil {
-		return nil, fmt.Errorf("no PCMA/PCMU codec in SDP offer (got %v)", audioMD.MediaName.Formats)
+		return nil, nil, fmt.Errorf("no PCMA/PCMU codec (formats: %v)", audioMD.MediaName.Formats)
 	}
 
-	remoteAddr := &net.UDPAddr{
+	addr := &net.UDPAddr{
 		IP:   net.ParseIP(remoteIP),
-		Port: remotePort,
+		Port: audioMD.MediaName.Port.Value,
+	}
+	return addr, codec, nil
+}
+
+// ClientConn is a SIP media session initiated by go2rtc (UAC role).
+// It implements core.Producer: the PBX call is the source of audio.
+// It also implements core.Consumer.AddTrack for the sendonly backchannel.
+type ClientConn struct {
+	core.Connection
+
+	udpConn      *net.UDPConn
+	remoteAddr   *net.UDPAddr
+	codec        *core.Codec
+	recvFromPBX  *core.Receiver // fed by readLoop, given to downstream consumers
+	dialog       *sipgo.DialogClientSession
+}
+
+// GetMedias implements core.Producer.
+func (c *ClientConn) GetMedias() []*core.Media {
+	return c.Medias
+}
+
+// GetTrack implements core.Producer.
+// Called for the recvonly media: returns a Receiver fed by inbound RTP from the PBX.
+func (c *ClientConn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
+	for _, recv := range c.Receivers {
+		if recv.Codec == codec {
+			return recv, nil
+		}
+	}
+	recv := core.NewReceiver(media, codec)
+	c.recvFromPBX = recv
+	c.Receivers = append(c.Receivers, recv)
+	go c.readLoop()
+	return recv, nil
+}
+
+// AddTrack implements core.Consumer (backchannel).
+// Called for the sendonly media: wraps a Sender that forwards RTP to the PBX.
+func (c *ClientConn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
+	sender := core.NewSender(media, codec)
+	sender.Handler = c.sendRTP
+	sender.WithParent(track)
+	sender.Start()
+	c.Senders = append(c.Senders, sender)
+	return nil
+}
+
+// Start implements core.Producer.
+// Blocks until the dialog ends so the streams engine knows when to reconnect.
+func (c *ClientConn) Start() error {
+	<-c.dialog.Context().Done()
+	return context.Cause(c.dialog.Context())
+}
+
+// Stop sends a BYE to the PBX (no-op if the PBX already hung up) then
+// closes the UDP socket and cleans up tracks.
+func (c *ClientConn) Stop() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.dialog.Bye(ctx)
+	return c.Connection.Stop()
+}
+
+func (c *ClientConn) sendRTP(packet *core.Packet) {
+	pkt := *packet
+	pkt.Header.PayloadType = c.codec.PayloadType
+	buf, err := pkt.Marshal()
+	if err != nil {
+		return
+	}
+	if n, err := c.udpConn.WriteTo(buf, c.remoteAddr); err == nil {
+		c.Send += n
+	}
+}
+
+func (c *ClientConn) readLoop() {
+	buf := make([]byte, 4096)
+	for {
+		n, _, err := c.udpConn.ReadFrom(buf)
+		if err != nil {
+			return // socket closed, exit cleanly
+		}
+		if c.recvFromPBX == nil {
+			continue
+		}
+		var pkt rtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		c.Recv += n
+		c.recvFromPBX.Input(&pkt)
+	}
+}
+
+// ─── Server-side Conn (UAS) ────────────────────────────────────────────────────
+
+// Conn is a server-side SIP media session (phone called us, UAS role).
+// It implements core.Consumer so go2rtc pushes stream audio to the SIP peer.
+// When two-way audio is negotiated it also acts as core.Producer (backchannel).
+type Conn struct {
+	core.Connection
+
+	udpConn    *net.UDPConn
+	remoteAddr *net.UDPAddr
+	codec      *core.Codec
+	backRecv   *core.Receiver // fed by readLoop; delivers PBX audio to go2rtc producer
+}
+
+func newServerConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
+	remoteAddr, codec, err := parseAudioAddr(offerSDP)
+	if err != nil {
+		return nil, err
 	}
 
-	// Bind a local UDP port for RTP exchange on the outbound interface.
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("bind RTP socket: %w", err)
@@ -253,12 +543,11 @@ func newConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 	conn.ID = core.NewID()
 	conn.FormatName = "sip"
 	conn.Protocol = "udp"
-	// Setting Transport lets core.Connection.Stop() close the UDP socket.
 	conn.Transport = udpConn
 
-	// Advertise to go2rtc what this session can do:
-	//   sendonly – we want audio from the producer to forward to the PBX.
-	//   recvonly – we can provide audio received from the PBX (backchannel).
+	// Consumer perspective:
+	//   sendonly – consume stream audio and forward to the SIP peer.
+	//   recvonly – accept audio from the SIP peer for the backchannel.
 	conn.Medias = []*core.Media{
 		{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{codec}},
 		{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec}},
@@ -272,9 +561,7 @@ func (c *Conn) GetMedias() []*core.Media {
 	return c.Medias
 }
 
-// AddTrack implements core.Consumer.
-// Called by the streams engine when a matching producer track is found.
-// We wrap the incoming receiver in a Sender that writes RTP to the PBX.
+// AddTrack implements core.Consumer — outgoing audio to the SIP peer.
 func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	sender := core.NewSender(media, codec)
 	sender.Handler = c.sendRTP
@@ -284,13 +571,9 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 	return nil
 }
 
-// sendRTP serialises a single RTP packet and sends it to the SIP peer.
 func (c *Conn) sendRTP(packet *core.Packet) {
-	// Shallow-copy so we can rewrite the payload type without affecting
-	// other consumers reading the same packet.
 	pkt := *packet
 	pkt.Header.PayloadType = c.codec.PayloadType
-
 	buf, err := pkt.Marshal()
 	if err != nil {
 		return
@@ -300,35 +583,26 @@ func (c *Conn) sendRTP(packet *core.Packet) {
 	}
 }
 
-// GetTrack implements core.Producer (backchannel).
-// Called by the streams engine when the upstream producer (e.g. Ring doorbell)
-// has a sendonly backchannel.  We return a Receiver fed by incoming UDP packets.
+// GetTrack implements core.Producer (backchannel) — inbound audio from the SIP peer.
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
-	// Deduplicate: return existing receiver if one already exists for this codec.
 	for _, recv := range c.Receivers {
 		if recv.Codec == codec {
 			return recv, nil
 		}
 	}
-
 	recv := core.NewReceiver(media, codec)
 	c.backRecv = recv
 	c.Receivers = append(c.Receivers, recv)
-
-	// Start reading inbound RTP from the SIP peer.
 	go c.readLoop()
-
 	return recv, nil
 }
 
-// Start implements core.Producer.
-// The read loop is launched in GetTrack; nothing more to do here.
+// Start implements core.Producer — no-op; readLoop started inside GetTrack.
 func (c *Conn) Start() error {
 	return nil
 }
 
-// answerSDP builds the SDP body for the 200 OK response.
-// It advertises our local UDP port and the single negotiated codec.
+// answerSDP builds the SDP for the 200 OK response.
 func (c *Conn) answerSDP() ([]byte, error) {
 	localUDP := c.udpConn.LocalAddr().(*net.UDPAddr)
 
@@ -352,40 +626,33 @@ func (c *Conn) answerSDP() ([]byte, error) {
 			AddressType: "IP4",
 			Address:     &sdp.Address{Address: ipStr},
 		},
-		TimeDescriptions: []sdp.TimeDescription{
-			{Timing: sdp.Timing{}},
-		},
-		MediaDescriptions: []*sdp.MediaDescription{
-			{
-				MediaName: sdp.MediaName{
-					Media:   "audio",
-					Port:    sdp.RangedPort{Value: localUDP.Port},
-					Protos:  []string{"RTP", "AVP"},
-					Formats: []string{strconv.Itoa(int(c.codec.PayloadType))},
-				},
-				Attributes: []sdp.Attribute{
-					{
-						Key:   "rtpmap",
-						Value: fmt.Sprintf("%d %s/%d", c.codec.PayloadType, c.codec.Name, c.codec.ClockRate),
-					},
-					{Key: "sendrecv"},
-				},
+		TimeDescriptions: []sdp.TimeDescription{{Timing: sdp.Timing{}}},
+		MediaDescriptions: []*sdp.MediaDescription{{
+			MediaName: sdp.MediaName{
+				Media:   "audio",
+				Port:    sdp.RangedPort{Value: localUDP.Port},
+				Protos:  []string{"RTP", "AVP"},
+				Formats: []string{strconv.Itoa(int(c.codec.PayloadType))},
 			},
-		},
+			Attributes: []sdp.Attribute{
+				{
+					Key:   "rtpmap",
+					Value: fmt.Sprintf("%d %s/%d", c.codec.PayloadType, c.codec.Name, c.codec.ClockRate),
+				},
+				{Key: "sendrecv"},
+			},
+		}},
 	}
 
 	return sd.Marshal()
 }
 
-// readLoop receives UDP datagrams on the RTP socket and feeds them into the
-// backchannel receiver so the upstream producer (doorbell) can play them.
-// It exits when the UDP socket is closed (i.e. Stop() is called).
 func (c *Conn) readLoop() {
 	buf := make([]byte, 4096)
 	for {
 		n, _, err := c.udpConn.ReadFrom(buf)
 		if err != nil {
-			return // socket closed, exit cleanly
+			return
 		}
 		if c.backRecv == nil {
 			continue
@@ -397,4 +664,20 @@ func (c *Conn) readLoop() {
 		c.Recv += n
 		c.backRecv.Input(&pkt)
 	}
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+// outboundIP returns the local IP the OS would use to reach remoteAddr.
+func outboundIP(remoteAddr string) net.IP {
+	host, _, _ := net.SplitHostPort(remoteAddr)
+	if host == "" {
+		return net.IPv4zero
+	}
+	conn, err := net.Dial("udp", net.JoinHostPort(host, "1"))
+	if err != nil {
+		return net.IPv4zero
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP
 }
