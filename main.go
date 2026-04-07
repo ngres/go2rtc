@@ -37,6 +37,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/roborock"
 	"github.com/AlexxIT/go2rtc/internal/rtmp"
 	"github.com/AlexxIT/go2rtc/internal/rtsp"
+	"github.com/AlexxIT/go2rtc/internal/sip"
 	"github.com/AlexxIT/go2rtc/internal/srtp"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/internal/tapo"
@@ -78,6 +79,7 @@ func main() {
 		{"homekit", homekit.Init},       // homekit source, HomeKit server
 		{"onvif", onvif.Init},           // onvif source, ONVIF API server
 		{"rtmp", rtmp.Init},             // rtmp source, RTMP server
+		{"sip", sip.Init},               // sip server (receive calls, two-way audio)
 		{"webtorrent", webtorrent.Init}, // webtorrent source, WebTorrent module
 		{"wyoming", wyoming.Init},
 		// Exec and script sources
