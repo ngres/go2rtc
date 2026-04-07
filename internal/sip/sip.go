@@ -149,16 +149,20 @@ func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 		return
 	}
 
+	stream.AddProducer(conn)
+
 	callID := ""
 	if cid := req.CallID(); cid != nil {
 		callID = string(*cid)
 	}
+	conn.Source = callID
 	calls.Store(callID, &callEntry{stream: stream, conn: conn})
 
 	answerSDP, err := conn.answerSDP()
 	if err != nil {
 		log.Error().Err(err).Msg("[sip] answer SDP")
 		stream.RemoveConsumer(conn)
+		stream.RemoveProducer(conn)
 		calls.Delete(callID)
 		_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 500, "Internal Server Error", nil))
 		return
@@ -188,6 +192,7 @@ func handleBye(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	if v, ok := calls.LoadAndDelete(callID); ok {
 		entry := v.(*callEntry)
 		entry.stream.RemoveConsumer(entry.conn)
+		entry.stream.RemoveProducer(entry.conn)
 		log.Info().Str("call_id", callID).Msg("[sip] incoming call ended (BYE)")
 	}
 
@@ -294,11 +299,13 @@ func sipProducerHandler(rawURL string) (core.Producer, error) {
 		return nil, fmt.Errorf("empty answer SDP")
 	}
 
-	remoteAddr, codec, err := parseAudioAddr(answerBody)
+	remoteAddr, codecs, err := parseAudioAddr(answerBody)
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, fmt.Errorf("answer SDP: %w", err)
 	}
+
+	codec := codecs[0]
 
 	conn := &ClientConn{
 		udpConn:    udpConn,
@@ -374,8 +381,8 @@ func buildOfferSDP(localIP net.IP, localPort int) []byte {
 	return b
 }
 
-// parseAudioAddr extracts the remote RTP address and chosen codec from an SDP body.
-func parseAudioAddr(body []byte) (*net.UDPAddr, *core.Codec, error) {
+// parseAudioAddr extracts the remote RTP address and all PCMA/PCMU codecs from an SDP body.
+func parseAudioAddr(body []byte) (*net.UDPAddr, []*core.Codec, error) {
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(body); err != nil {
 		return nil, nil, fmt.Errorf("unmarshal: %w", err)
@@ -400,15 +407,14 @@ func parseAudioAddr(body []byte) (*net.UDPAddr, *core.Codec, error) {
 		remoteIP = audioMD.ConnectionInformation.Address.Address
 	}
 
-	var codec *core.Codec
+	var codecs []*core.Codec
 	for _, format := range audioMD.MediaName.Formats {
 		c := core.UnmarshalCodec(audioMD, format)
 		if c.Name == core.CodecPCMA || c.Name == core.CodecPCMU {
-			codec = c
-			break
+			codecs = append(codecs, c)
 		}
 	}
-	if codec == nil {
+	if len(codecs) == 0 {
 		return nil, nil, fmt.Errorf("no PCMA/PCMU codec (formats: %v)", audioMD.MediaName.Formats)
 	}
 
@@ -416,7 +422,7 @@ func parseAudioAddr(body []byte) (*net.UDPAddr, *core.Codec, error) {
 		IP:   net.ParseIP(remoteIP),
 		Port: audioMD.MediaName.Port.Value,
 	}
-	return addr, codec, nil
+	return addr, codecs, nil
 }
 
 // ClientConn is a SIP media session initiated by go2rtc (UAC role).
@@ -425,11 +431,11 @@ func parseAudioAddr(body []byte) (*net.UDPAddr, *core.Codec, error) {
 type ClientConn struct {
 	core.Connection
 
-	udpConn      *net.UDPConn
-	remoteAddr   *net.UDPAddr
-	codec        *core.Codec
-	recvFromPBX  *core.Receiver // fed by readLoop, given to downstream consumers
-	dialog       *sipgo.DialogClientSession
+	udpConn     *net.UDPConn
+	remoteAddr  *net.UDPAddr
+	codec       *core.Codec
+	recvFromPBX *core.Receiver // fed by readLoop, given to downstream consumers
+	dialog      *sipgo.DialogClientSession
 }
 
 // GetMedias implements core.Producer.
@@ -520,12 +526,14 @@ type Conn struct {
 
 	udpConn    *net.UDPConn
 	remoteAddr *net.UDPAddr
-	codec      *core.Codec
-	backRecv   *core.Receiver // fed by readLoop; delivers PBX audio to go2rtc producer
+	codecs     []*core.Codec
+	codec      *core.Codec // negotiated codec
+
+	receivers map[byte]*core.Receiver
 }
 
 func newServerConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
-	remoteAddr, codec, err := parseAudioAddr(offerSDP)
+	remoteAddr, codecs, err := parseAudioAddr(offerSDP)
 	if err != nil {
 		return nil, err
 	}
@@ -538,7 +546,8 @@ func newServerConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 	conn := &Conn{
 		udpConn:    udpConn,
 		remoteAddr: remoteAddr,
-		codec:      codec,
+		codecs:     codecs,
+		receivers:  make(map[byte]*core.Receiver),
 	}
 	conn.ID = core.NewID()
 	conn.FormatName = "sip"
@@ -549,8 +558,8 @@ func newServerConn(offerSDP []byte, localIP net.IP) (*Conn, error) {
 	//   sendonly – consume stream audio and forward to the SIP peer.
 	//   recvonly – accept audio from the SIP peer for the backchannel.
 	conn.Medias = []*core.Media{
-		{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{codec}},
-		{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec}},
+		{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: codecs},
+		{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: codecs},
 	}
 
 	return conn, nil
@@ -563,6 +572,7 @@ func (c *Conn) GetMedias() []*core.Media {
 
 // AddTrack implements core.Consumer — outgoing audio to the SIP peer.
 func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
+	c.codec = codec // use this codec for answer and outgoing RTP
 	sender := core.NewSender(media, codec)
 	sender.Handler = c.sendRTP
 	sender.WithParent(track)
@@ -572,6 +582,9 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 }
 
 func (c *Conn) sendRTP(packet *core.Packet) {
+	if c.codec == nil {
+		return
+	}
 	pkt := *packet
 	pkt.Header.PayloadType = c.codec.PayloadType
 	buf, err := pkt.Marshal()
@@ -585,15 +598,18 @@ func (c *Conn) sendRTP(packet *core.Packet) {
 
 // GetTrack implements core.Producer (backchannel) — inbound audio from the SIP peer.
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
-	for _, recv := range c.Receivers {
-		if recv.Codec == codec {
-			return recv, nil
-		}
+	if recv, ok := c.receivers[codec.PayloadType]; ok {
+		return recv, nil
 	}
+
 	recv := core.NewReceiver(media, codec)
-	c.backRecv = recv
+	c.receivers[codec.PayloadType] = recv
 	c.Receivers = append(c.Receivers, recv)
-	go c.readLoop()
+
+	if len(c.receivers) == 1 {
+		go c.readLoop()
+	}
+
 	return recv, nil
 }
 
@@ -609,6 +625,11 @@ func (c *Conn) answerSDP() ([]byte, error) {
 	ipStr := "0.0.0.0"
 	if localUDP.IP != nil && !localUDP.IP.IsUnspecified() {
 		ipStr = localUDP.IP.String()
+	}
+
+	codec := c.codec
+	if codec == nil {
+		codec = c.codecs[0]
 	}
 
 	sd := sdp.SessionDescription{
@@ -632,12 +653,12 @@ func (c *Conn) answerSDP() ([]byte, error) {
 				Media:   "audio",
 				Port:    sdp.RangedPort{Value: localUDP.Port},
 				Protos:  []string{"RTP", "AVP"},
-				Formats: []string{strconv.Itoa(int(c.codec.PayloadType))},
+				Formats: []string{strconv.Itoa(int(codec.PayloadType))},
 			},
 			Attributes: []sdp.Attribute{
 				{
 					Key:   "rtpmap",
-					Value: fmt.Sprintf("%d %s/%d", c.codec.PayloadType, c.codec.Name, c.codec.ClockRate),
+					Value: fmt.Sprintf("%d %s/%d", codec.PayloadType, codec.Name, codec.ClockRate),
 				},
 				{Key: "sendrecv"},
 			},
@@ -654,15 +675,16 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			return
 		}
-		if c.backRecv == nil {
-			continue
-		}
+
 		var pkt rtp.Packet
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
-		c.Recv += n
-		c.backRecv.Input(&pkt)
+
+		if recv, ok := c.receivers[pkt.PayloadType]; ok {
+			c.Recv += n
+			recv.Input(&pkt)
+		}
 	}
 }
 
