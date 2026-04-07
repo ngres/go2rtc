@@ -364,14 +364,17 @@ func buildOfferSDP(localIP net.IP, localPort int) []byte {
 		TimeDescriptions: []sdp.TimeDescription{{Timing: sdp.Timing{}}},
 		MediaDescriptions: []*sdp.MediaDescription{{
 			MediaName: sdp.MediaName{
-				Media:   "audio",
-				Port:    sdp.RangedPort{Value: localPort},
-				Protos:  []string{"RTP", "AVP"},
-				Formats: []string{"0", "8"},
+				Media:  "audio",
+				Port:   sdp.RangedPort{Value: localPort},
+				Protos: []string{"RTP", "AVP"},
+				// 0: PCMU, 8: PCMA, 14: MP3 (Static)
+				// 96-111: Dynamic assignments for Opus, AAC, L16, etc.
+				Formats: []string{"0", "8", "96"},
 			},
 			Attributes: []sdp.Attribute{
 				{Key: "rtpmap", Value: "0 PCMU/8000"},
 				{Key: "rtpmap", Value: "8 PCMA/8000"},
+				{Key: "rtpmap", Value: "96 OPUS/48000/2"},
 				{Key: "sendrecv"},
 			},
 		}},
@@ -410,12 +413,12 @@ func parseAudioAddr(body []byte) (*net.UDPAddr, []*core.Codec, error) {
 	var codecs []*core.Codec
 	for _, format := range audioMD.MediaName.Formats {
 		c := core.UnmarshalCodec(audioMD, format)
-		if c.Name == core.CodecPCMA || c.Name == core.CodecPCMU {
+		if c.Name == core.CodecPCMA || c.Name == core.CodecPCMU || c.Name == core.CodecOpus {
 			codecs = append(codecs, c)
 		}
 	}
 	if len(codecs) == 0 {
-		return nil, nil, fmt.Errorf("no PCMA/PCMU codec (formats: %v)", audioMD.MediaName.Formats)
+		return nil, nil, fmt.Errorf("no PCMA/PCMU/Opus codec (formats: %v)", audioMD.MediaName.Formats)
 	}
 
 	addr := &net.UDPAddr{
@@ -658,7 +661,7 @@ func (c *Conn) answerSDP() ([]byte, error) {
 			Attributes: []sdp.Attribute{
 				{
 					Key:   "rtpmap",
-					Value: fmt.Sprintf("%d %s/%d", codec.PayloadType, codec.Name, codec.ClockRate),
+					Value: codecRTPMap(*codec),
 				},
 				{Key: "sendrecv"},
 			},
@@ -666,6 +669,13 @@ func (c *Conn) answerSDP() ([]byte, error) {
 	}
 
 	return sd.Marshal()
+}
+
+func codecRTPMap(codec core.Codec) string {
+	if codec.Channels > 1 {
+		return fmt.Sprintf("%d %s/%d/%d", codec.PayloadType, codec.Name, codec.ClockRate, codec.Channels)
+	}
+	return fmt.Sprintf("%d %s/%d", codec.PayloadType, codec.Name, codec.ClockRate)
 }
 
 func (c *Conn) readLoop() {
