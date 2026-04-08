@@ -3,12 +3,10 @@ package sip
 import (
 	"context"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/emiago/sipgo"
-	"github.com/pion/rtp"
 )
 
 // UACConn is a SIP media session initiated by go2rtc (UAC role).
@@ -21,42 +19,8 @@ import (
 //
 // The two roles differ only in the Media directions set by their respective handlers.
 type UACConn struct {
-	core.Connection
-
-	udpConn    *net.UDPConn
-	remoteAddr *net.UDPAddr
-	codec      *core.Codec
-	dialog     *sipgo.DialogClientSession
-
-	// recvByPT maps RTP payload type → Receiver for routing inbound audio.
-	recvByPT map[byte]*core.Receiver
-}
-
-// GetTrack implements core.Producer.
-// Returns a Receiver fed by inbound RTP from the remote party. Starts the
-// read loop on the first call.
-func (c *UACConn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
-	if recv, ok := c.recvByPT[codec.PayloadType]; ok {
-		return recv, nil
-	}
-	recv := core.NewReceiver(media, codec)
-	c.recvByPT[codec.PayloadType] = recv
-	c.Receivers = append(c.Receivers, recv)
-	if len(c.recvByPT) == 1 {
-		go c.readLoop()
-	}
-	return recv, nil
-}
-
-// AddTrack implements core.Consumer.
-// Wraps a Sender that forwards RTP packets to the remote party.
-func (c *UACConn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
-	sender := core.NewSender(media, codec)
-	sender.Handler = c.sendRTP
-	sender.WithParent(track)
-	sender.Start()
-	c.Senders = append(c.Senders, sender)
-	return nil
+	SIPConn
+	dialog *sipgo.DialogClientSession
 }
 
 // Start implements core.Producer.
@@ -71,55 +35,22 @@ func (c *UACConn) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = c.dialog.Bye(ctx)
-	return c.Connection.Stop()
-}
-
-func (c *UACConn) sendRTP(packet *core.Packet) {
-	pkt := *packet
-	pkt.Header.PayloadType = c.codec.PayloadType
-	buf, err := pkt.Marshal()
-	if err != nil {
-		return
-	}
-	if n, err := c.udpConn.WriteTo(buf, c.remoteAddr); err == nil {
-		c.Send += n
-	}
-}
-
-func (c *UACConn) readLoop() {
-	buf := make([]byte, 4096)
-	for {
-		n, _, err := c.udpConn.ReadFrom(buf)
-		if err != nil {
-			return // socket closed, exit cleanly
-		}
-		var pkt rtp.Packet
-		if err := pkt.Unmarshal(buf[:n]); err != nil {
-			continue
-		}
-		if recv, ok := c.recvByPT[pkt.PayloadType]; ok {
-			c.Recv += n
-			recv.Input(&pkt)
-		}
-	}
+	return c.SIPConn.Stop()
 }
 
 // newUACConn populates a UACConn from a completed sipSession.
 // Callers must set Medias before use.
 func newUACConn(sess *sipSession, rawURL string) *UACConn {
 	conn := &UACConn{
-		udpConn:    sess.udpConn,
-		remoteAddr: sess.remoteAddr,
-		codec:      sess.codec,
-		dialog:     sess.dialog,
-		recvByPT:   make(map[byte]*core.Receiver),
+		SIPConn: SIPConn{
+			udpConn:    sess.udpConn,
+			remoteAddr: sess.remoteAddr,
+			codec:      sess.codec,
+		},
+		dialog: sess.dialog,
 	}
-	conn.ID = core.NewID()
-	conn.FormatName = "sip"
-	conn.Protocol = "udp"
-	conn.Source = rawURL
+	conn.init(rawURL)
 	conn.RemoteAddr = sess.remoteAddr.String()
-	conn.Transport = sess.udpConn
 	return conn
 }
 
@@ -172,9 +103,7 @@ func sipConsumerHandler(rawURL string) (core.Consumer, func(), error) {
 
 	// run blocks until the dialog ends; streams.Publish calls RemoveConsumer → Stop after it returns.
 	run := func() {
-		fmt.Println("[sip] start")
 		<-conn.dialog.Context().Done()
-		fmt.Println("[sip] end")
 	}
 
 	return conn, run, nil

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo"
-	sipmsg "github.com/emiago/sipgo/sip"
+	"github.com/emiago/sipgo/sip"
 )
 
 const (
@@ -17,46 +17,33 @@ const (
 	reregisterBuffer = 30  // re-register this many seconds before expiry
 )
 
+type ThrunkConfig struct {
+	Host     string `yaml:"host" json:"host"`
+	Port     int    `yaml:"port" json:"port"`
+	Username string `yaml:"username" json:"-"`
+	Password string `yaml:"password" json:"-"`
+}
+
 // trunks holds all configured trunks, keyed by name. Populated by Init.
 var trunks = map[string]*Trunk{}
 
 // Trunk maintains a persistent SIP REGISTER with a remote PBX/proxy.
 // It provides outbound call capability via dialVia.
 type Trunk struct {
-	name     string
-	username string
-	password string
-	host     string
-	port     int
+	name   string
+	config ThrunkConfig
 
 	cancel context.CancelFunc
 }
 
 // newTrunk parses rawURL (sip:user:pass@host:port), starts the registration
 // keep-alive loop, and returns the Trunk.
-func newTrunk(name, rawURL string) (*Trunk, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse trunk URL %q: %w", rawURL, err)
-	}
-
-	host, portStr, splitErr := net.SplitHostPort(u.Host)
-	if splitErr != nil {
-		host = u.Host
-		portStr = "5060"
-	}
-	port, _ := strconv.Atoi(portStr)
-	if port == 0 {
-		port = 5060
-	}
+func newTrunk(name string, config ThrunkConfig) (*Trunk, error) {
 
 	t := &Trunk{
-		name:     name,
-		username: u.User.Username(),
-		host:     host,
-		port:     port,
+		name:   name,
+		config: config,
 	}
-	t.password, _ = u.User.Password()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
@@ -71,7 +58,7 @@ func (t *Trunk) stop() {
 }
 
 func (t *Trunk) pbxAddr() string {
-	return net.JoinHostPort(t.host, strconv.Itoa(t.port))
+	return net.JoinHostPort(t.config.Host, strconv.Itoa(t.config.Port))
 }
 
 // registerLoop sends REGISTER on startup and re-registers before the
@@ -101,34 +88,56 @@ func (t *Trunk) registerLoop(ctx context.Context) {
 // register sends a single REGISTER transaction, handling digest auth if
 // the server challenges with 401/407.
 func (t *Trunk) register(ctx context.Context) error {
-	recipient := sipmsg.Uri{
+	// 1. Define the Registrar URI
+	recipient := sip.Uri{
 		Scheme: "sip",
-		User:   t.username,
-		Host:   t.host,
-		Port:   t.port,
+		Host:   t.config.Host,
+		// Port is usually handled by the transport/client,
+		// but can be set if using a non-standard port.
 	}
 
-	localIP := outboundIP(t.pbxAddr())
+	req := sip.NewRequest(sip.REGISTER, recipient)
 
-	req := sipmsg.NewRequest(sipmsg.REGISTER, recipient)
-	req.AppendHeader(sipmsg.NewHeader(
-		"Contact",
-		fmt.Sprintf("<sip:%s@%s>", t.username, localIP.String()),
-	))
-	req.AppendHeader(sipmsg.NewHeader("Expires", strconv.Itoa(registerExpiry)))
+	// 2. Define the Identity (Used for both From and To)
+	// Most registrars require From and To to be the same for REGISTER
+	identity := sip.Uri{
+		User: t.config.Username,
+		Host: t.config.Host,
+	}
+
+	req.AppendHeader(&sip.FromHeader{
+		DisplayName: "Easybell",
+		Address:     identity,
+	})
+
+	req.AppendHeader(&sip.ToHeader{
+		Address: identity,
+	})
+
+	// 3. Structured Contact Header
+	localIP := outboundIP(t.pbxAddr())
+	req.AppendHeader(&sip.ContactHeader{
+		Address: sip.Uri{
+			User: t.config.Username,
+			Host: localIP.String(),
+			// Port: if you want to force the listening port
+		},
+	})
 
 	tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	res, err := sipClient.Do(tctx, req, sipgo.ClientRequestRegisterBuild)
+	// 5. Initial Request (using ClientRequestBuild to handle CSeq and Call-ID)
+	res, err := sipClient.Do(tctx, req, sipgo.ClientRequestBuild)
 	if err != nil {
 		return err
 	}
 
+	// 6. Handle Challenge
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		res, err = sipClient.DoDigestAuth(tctx, req, res, sipgo.DigestAuth{
-			Username: t.username,
-			Password: t.password,
+			Username: t.config.Username,
+			Password: t.config.Password,
 		})
 		if err != nil {
 			return err
@@ -146,9 +155,9 @@ func (t *Trunk) register(ctx context.Context) error {
 // Credentials and PBX address are taken from the trunk configuration.
 func (t *Trunk) dialVia(callee string) (*sipSession, error) {
 	rawURL := fmt.Sprintf("sip://%s:%s@%s:%d/%s",
-		url.PathEscape(t.username),
-		url.PathEscape(t.password),
-		t.host, t.port, url.PathEscape(callee),
+		url.PathEscape(t.config.Username),
+		url.PathEscape(t.config.Password),
+		t.config.Host, t.config.Port, url.PathEscape(callee),
 	)
 	return dialSIP(rawURL)
 }

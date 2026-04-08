@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/AlexxIT/go2rtc/internal/app"
@@ -20,6 +21,7 @@ var (
 	ua            *sipgo.UserAgent
 	sipClient     *sipgo.Client
 	clientDialogs *sipgo.DialogClientCache
+	routing       map[string]string
 )
 
 // callEntry tracks an active server-side SIP session (phone calling us).
@@ -38,10 +40,11 @@ var registrations sync.Map
 func Init() {
 	var conf struct {
 		Mod struct {
-			Listen   string            `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
-			Username string            `yaml:"username" json:"-"`
-			Password string            `yaml:"password" json:"-"`
-			Trunks   map[string]string `yaml:"trunks" json:"trunks"`
+			Listen   string                  `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
+			Username string                  `yaml:"username" json:"-"`
+			Password string                  `yaml:"password" json:"-"`
+			Trunks   map[string]ThrunkConfig `yaml:"trunks" json:"trunks"`
+			Routing  map[string][]string     `yaml:"routing" json:"routing"`
 		} `yaml:"sip"`
 	}
 
@@ -74,8 +77,8 @@ func Init() {
 	clientDialogs = sipgo.NewDialogClientCache(sipClient, contactHDR)
 
 	// Start persistent registrations for all configured trunks.
-	for name, rawURL := range conf.Mod.Trunks {
-		t, err := newTrunk(name, rawURL)
+	for name, config := range conf.Mod.Trunks {
+		t, err := newTrunk(name, config)
 		if err != nil {
 			log.Error().Err(err).Str("trunk", name).Msg("[sip] init trunk")
 			continue
@@ -92,6 +95,13 @@ func Init() {
 
 	if conf.Mod.Listen == "" {
 		return
+	}
+
+	routing = map[string]string{}
+	for source, v := range conf.Mod.Routing {
+		for _, username := range v {
+			routing[strings.ToLower(username)] = source
+		}
 	}
 
 	go runServer(conf.Mod.Listen)
@@ -143,10 +153,10 @@ func handleRegister(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 100, "Trying", nil))
 
-	// Derive stream name from the request URI user part, e.g. sip:doorbell@host → "doorbell".
-	streamName := req.Recipient.User
-	if streamName == "" {
-		streamName = "sip"
+	username := strings.ToLower(req.To().Address.User)
+	streamName, ok := routing[username]
+	if !ok {
+		streamName = username
 	}
 
 	stream := streams.Get(streamName)

@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
 )
 
@@ -14,14 +13,8 @@ import (
 // It implements core.Consumer so go2rtc pushes stream audio to the SIP peer.
 // When two-way audio is negotiated it also acts as core.Producer (backchannel).
 type UASConn struct {
-	core.Connection
-
-	udpConn    *net.UDPConn
-	remoteAddr *net.UDPAddr
-	codecs     []*core.Codec
-	codec      *core.Codec // negotiated codec
-
-	receivers map[byte]*core.Receiver
+	SIPConn
+	codecs []*core.Codec
 }
 
 func newServerConn(offerSDP []byte, localIP net.IP) (*UASConn, error) {
@@ -36,15 +29,13 @@ func newServerConn(offerSDP []byte, localIP net.IP) (*UASConn, error) {
 	}
 
 	conn := &UASConn{
-		udpConn:    udpConn,
-		remoteAddr: remoteAddr,
-		codecs:     codecs,
-		receivers:  make(map[byte]*core.Receiver),
+		SIPConn: SIPConn{
+			udpConn:    udpConn,
+			remoteAddr: remoteAddr,
+		},
+		codecs: codecs,
 	}
-	conn.ID = core.NewID()
-	conn.FormatName = "sip"
-	conn.Protocol = "udp"
-	conn.Transport = udpConn
+	conn.init("")
 
 	// Consumer perspective:
 	//   sendonly – consume stream audio and forward to the SIP peer.
@@ -55,54 +46,6 @@ func newServerConn(offerSDP []byte, localIP net.IP) (*UASConn, error) {
 	}
 
 	return conn, nil
-}
-
-// GetMedias implements core.Consumer.
-func (c *UASConn) GetMedias() []*core.Media {
-	return c.Medias
-}
-
-// AddTrack implements core.Consumer — outgoing audio to the SIP peer.
-func (c *UASConn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
-	c.codec = codec // use this codec for answer and outgoing RTP
-	sender := core.NewSender(media, codec)
-	sender.Handler = c.sendRTP
-	sender.WithParent(track)
-	sender.Start()
-	c.Senders = append(c.Senders, sender)
-	return nil
-}
-
-func (c *UASConn) sendRTP(packet *core.Packet) {
-	if c.codec == nil {
-		return
-	}
-	pkt := *packet
-	pkt.Header.PayloadType = c.codec.PayloadType
-	buf, err := pkt.Marshal()
-	if err != nil {
-		return
-	}
-	if n, err := c.udpConn.WriteTo(buf, c.remoteAddr); err == nil {
-		c.Send += n
-	}
-}
-
-// GetTrack implements core.Producer (backchannel) — inbound audio from the SIP peer.
-func (c *UASConn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
-	if recv, ok := c.receivers[codec.PayloadType]; ok {
-		return recv, nil
-	}
-
-	recv := core.NewReceiver(media, codec)
-	c.receivers[codec.PayloadType] = recv
-	c.Receivers = append(c.Receivers, recv)
-
-	if len(c.receivers) == 1 {
-		go c.readLoop()
-	}
-
-	return recv, nil
 }
 
 // Start implements core.Producer — no-op; readLoop is started inside GetTrack.
@@ -158,24 +101,4 @@ func (c *UASConn) answerSDP() ([]byte, error) {
 	}
 
 	return sd.Marshal()
-}
-
-func (c *UASConn) readLoop() {
-	buf := make([]byte, 4096)
-	for {
-		n, _, err := c.udpConn.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-
-		var pkt rtp.Packet
-		if err := pkt.Unmarshal(buf[:n]); err != nil {
-			continue
-		}
-
-		if recv, ok := c.receivers[pkt.PayloadType]; ok {
-			c.Recv += n
-			recv.Input(&pkt)
-		}
-	}
 }
