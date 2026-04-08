@@ -18,10 +18,11 @@ const (
 )
 
 type ThrunkConfig struct {
-	Host     string `yaml:"host" json:"host"`
-	Port     int    `yaml:"port" json:"port"`
-	Username string `yaml:"username" json:"-"`
-	Password string `yaml:"password" json:"-"`
+	DisplayName string `yaml:"display_name" json:"display_name"`
+	Host        string `yaml:"host" json:"host"`
+	Port        int    `yaml:"port" json:"port"`
+	Username    string `yaml:"username" json:"-"`
+	Password    string `yaml:"password" json:"-"`
 }
 
 // trunks holds all configured trunks, keyed by name. Populated by Init.
@@ -106,10 +107,9 @@ func (t *Trunk) register(ctx context.Context) error {
 	}
 
 	req.AppendHeader(&sip.FromHeader{
-		DisplayName: "Easybell",
+		DisplayName: t.name,
 		Address:     identity,
 	})
-
 	req.AppendHeader(&sip.ToHeader{
 		Address: identity,
 	})
@@ -159,5 +159,5 @@ func (t *Trunk) dialVia(callee string) (*sipSession, error) {
 		url.PathEscape(t.config.Password),
 		t.config.Host, t.config.Port, url.PathEscape(callee),
 	)
-	return dialSIP(rawURL)
+	return dialSIP(rawURL, &t.config)
 }

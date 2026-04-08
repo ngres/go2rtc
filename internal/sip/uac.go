@@ -129,5 +129,5 @@ func dialFromURL(rawURL string) (*sipSession, error) {
 	}
 
 	// Fallback: pass the raw URL directly to dialSIP (legacy full-URL form).
-	return dialSIP(rawURL)
+	return dialSIP(rawURL, &ThrunkConfig{})
 }

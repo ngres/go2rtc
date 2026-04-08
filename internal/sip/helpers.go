@@ -11,6 +11,7 @@ import (
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 	sipmsg "github.com/emiago/sipgo/sip"
 	"github.com/pion/sdp/v3"
 )
@@ -46,7 +47,7 @@ func dialRegistered(callee string) (*sipSession, error) {
 	}
 	hostPort := v.(string)
 	rawURL := fmt.Sprintf("sip://%s/%s", hostPort, callee)
-	return dialSIP(rawURL)
+	return dialSIP(rawURL, &ThrunkConfig{})
 }
 
 // ─── Shared dial helper ─────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ type sipSession struct {
 //
 //	sip://user:pass@host:port/callee  – all fields explicit
 //	sip:callee                        – host, port and credentials taken from pbxConf
-func dialSIP(rawURL string) (*sipSession, error) {
+func dialSIP(rawURL string, trunk *ThrunkConfig) (*sipSession, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse SIP URL: %w", err)
@@ -113,13 +114,20 @@ func dialSIP(rawURL string) (*sipSession, error) {
 		Port:   pbxPort,
 	}
 	ct := sipmsg.ContentTypeHeader("application/sdp")
+	from := sipmsg.FromHeader{
+		DisplayName: trunk.DisplayName,
+		Address: sip.Uri{
+			User: trunk.Username,
+			Host: trunk.Host,
+		},
+	}
 
 	// 30-second timeout so the caller's reconnect timer doesn't fire before we
 	// know whether the remote party answered.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	dialog, err := clientDialogs.Invite(ctx, recipient, offerSDP, &ct)
+	dialog, err := clientDialogs.Invite(ctx, recipient, offerSDP, &ct, &from)
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, fmt.Errorf("INVITE: %w", err)
