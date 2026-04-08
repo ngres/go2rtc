@@ -38,12 +38,17 @@ type callEntry struct {
 // calls maps SIP Call-ID → *callEntry for server-side sessions.
 var calls sync.Map
 
+// registrations maps SIP username → contact host:port for phones registered
+// with the internal SIP server. Used to call internal phones via sip:callee.
+var registrations sync.Map
+
 func Init() {
 	var conf struct {
 		Mod struct {
-			Listen   string `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
-			Username string `yaml:"username" json:"-"`
-			Password string `yaml:"password" json:"-"`
+			Listen   string            `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
+			Username string            `yaml:"username" json:"-"`
+			Password string            `yaml:"password" json:"-"`
+			Trunks   map[string]string `yaml:"trunks" json:"trunks"`
 		} `yaml:"sip"`
 	}
 
@@ -75,11 +80,21 @@ func Init() {
 	}
 	clientDialogs = sipgo.NewDialogClientCache(sipClient, contactHDR)
 
-	// Register handler so streams can use  sip://user:pass@pbx/callee  as a source.
+	// Start persistent registrations for all configured trunks.
+	for name, rawURL := range conf.Mod.Trunks {
+		t, err := newTrunk(name, rawURL)
+		if err != nil {
+			log.Error().Err(err).Str("trunk", name).Msg("[sip] init trunk")
+			continue
+		}
+		trunks[name] = t
+	}
+
+	// Register handler so streams can use  sip:trunk/callee  or  sip:callee  as a source.
 	streams.HandleFunc("sip", sipProducerHandler)
 
-	// Register consumer handler so publish destinations like  sip:callee  or
-	// sip://user:pass@host/callee  forward stream audio to a PBX.
+	// Register consumer handler so publish destinations like  sip:trunk/callee  or
+	// sip:callee  forward stream audio to a remote party.
 	streams.HandleConsumerFunc("sip", sipConsumerHandler)
 
 	if conf.Mod.Listen == "" {
@@ -98,6 +113,7 @@ func runServer(listen string) {
 		return
 	}
 
+	srv.OnRegister(handleRegister)
 	srv.OnInvite(handleInvite)
 	srv.OnBye(handleBye)
 	srv.OnAck(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
@@ -112,6 +128,23 @@ func runServer(listen string) {
 	if err := srv.ListenAndServe(context.Background(), "udp", listen); err != nil {
 		log.Error().Err(err).Msg("[sip] serve")
 	}
+}
+
+func handleRegister(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+	user := req.From().Address.User
+	if user == "" {
+		_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 400, "Bad Request", nil))
+		return
+	}
+	if contact := req.Contact(); contact != nil {
+		addr := &contact.Address
+		hostPort := net.JoinHostPort(addr.Host, strconv.Itoa(addr.Port))
+		registrations.Store(user, hostPort)
+		log.Info().Str("user", user).Str("contact", hostPort).Msg("[sip] phone registered")
+	}
+	res := sipmsg.NewResponseFromRequest(req, 200, "OK", nil)
+	res.AppendHeader(sipmsg.NewHeader("Expires", strconv.Itoa(registerExpiry)))
+	_ = tx.Respond(res)
 }
 
 func handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
@@ -380,6 +413,40 @@ func (c *Conn) readLoop() {
 			recv.Input(&pkt)
 		}
 	}
+}
+
+// ─── URL helpers ───────────────────────────────────────────────────────────────
+
+// parseSIPURL splits a SIP URL into trunk name and callee.
+//
+//	sip:trunk/callee  →  ("trunk", "callee")
+//	sip:callee        →  ("", "callee")
+func parseSIPURL(rawURL string) (trunkName, callee string, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", "", fmt.Errorf("parse SIP URL: %w", err)
+	}
+	opaque := u.Opaque
+	if opaque == "" {
+		// Hierarchical form sip://host/path — not a trunk URL; pass through to dialSIP.
+		return "", "", nil
+	}
+	if trunk, callee, ok := strings.Cut(opaque, "/"); ok {
+		return trunk, callee, nil
+	}
+	return "", opaque, nil
+}
+
+// dialRegistered calls a phone that has registered with the internal SIP server.
+// It looks up the phone's contact address from the registration table.
+func dialRegistered(callee string) (*sipSession, error) {
+	v, ok := registrations.Load(callee)
+	if !ok {
+		return nil, fmt.Errorf("SIP callee %q is not registered with the internal server", callee)
+	}
+	hostPort := v.(string)
+	rawURL := fmt.Sprintf("sip://%s/%s", hostPort, callee)
+	return dialSIP(rawURL)
 }
 
 // ─── Shared dial helper ─────────────────────────────────────────────────────────

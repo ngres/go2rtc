@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 
@@ -122,12 +123,12 @@ func newUACConn(sess *sipSession, rawURL string) *UACConn {
 	return conn
 }
 
-// sipProducerHandler is called by the streams engine when a sip:// URL is used as a source.
+// sipProducerHandler is called by the streams engine when a sip: URL is used as a source.
 //
-// URL format:  sip://username:password@host:5060/callee
-// Short form:  sip:callee  (uses sip.pbx config for host/port/credentials)
+//	sip:trunk/callee  — dial callee via the named trunk
+//	sip:callee        — call a phone registered with the internal SIP server
 func sipProducerHandler(rawURL string) (core.Producer, error) {
-	sess, err := dialSIP(rawURL)
+	sess, err := dialFromURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -146,14 +147,14 @@ func sipProducerHandler(rawURL string) (core.Producer, error) {
 	return conn, nil
 }
 
-// sipConsumerHandler is called by streams.Publish when a sip:// destination is configured.
+// sipConsumerHandler is called by streams.Publish when a sip: destination is configured.
 // It dials the remote party and forwards stream audio to it, routing the reply audio
 // back as a backchannel.
 //
-// URL format:  sip://username:password@host:5060/callee
-// Short form:  sip:callee  (uses sip.pbx config for host/port/credentials)
+//	sip:trunk/callee  — call callee via the named trunk
+//	sip:callee        — call a phone registered with the internal SIP server
 func sipConsumerHandler(rawURL string) (core.Consumer, func(), error) {
-	sess, err := dialSIP(rawURL)
+	sess, err := dialFromURL(rawURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -167,10 +168,33 @@ func sipConsumerHandler(rawURL string) (core.Consumer, func(), error) {
 	log.Info().
 		Str("codec", sess.codec.Name).
 		Str("remote_rtp", sess.remoteAddr.String()).
-		Msg("[sip] PBX consumer established")
+		Msg("[sip] consumer established")
 
 	// run blocks until the dialog ends; streams.Publish calls RemoveConsumer → Stop after it returns.
 	run := func() { <-conn.dialog.Context().Done() }
 
 	return conn, run, nil
+}
+
+// dialFromURL resolves trunk name and callee from a sip: URL and places the call.
+func dialFromURL(rawURL string) (*sipSession, error) {
+	trunkName, callee, err := parseSIPURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if trunkName != "" {
+		t, ok := trunks[trunkName]
+		if !ok {
+			return nil, fmt.Errorf("SIP trunk %q not configured", trunkName)
+		}
+		return t.dialVia(callee)
+	}
+
+	if callee != "" {
+		return dialRegistered(callee)
+	}
+
+	// Fallback: pass the raw URL directly to dialSIP (legacy full-URL form).
+	return dialSIP(rawURL)
 }
