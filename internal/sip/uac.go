@@ -171,7 +171,11 @@ func sipConsumerHandler(rawURL string) (core.Consumer, func(), error) {
 		Msg("[sip] consumer established")
 
 	// run blocks until the dialog ends; streams.Publish calls RemoveConsumer → Stop after it returns.
-	run := func() { <-conn.dialog.Context().Done() }
+	run := func() {
+		fmt.Println("[sip] start")
+		<-conn.dialog.Context().Done()
+		fmt.Println("[sip] end")
+	}
 
 	return conn, run, nil
 }

@@ -1,6 +1,9 @@
 package streams
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 func (s *Stream) Publish(url string) error {
 	cons, run, err := GetConsumer(url)
@@ -16,6 +19,7 @@ func (s *Stream) Publish(url string) error {
 		run()
 		s.RemoveConsumer(cons)
 
+		fmt.Printf("[streams] consumer for %q removed, retrying...\n", url)
 		// TODO: more smart retry
 		time.Sleep(5 * time.Second)
 		_ = s.Publish(url)
