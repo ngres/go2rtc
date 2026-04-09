@@ -11,7 +11,6 @@ import (
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/emiago/sipgo"
-	"github.com/emiago/sipgo/sip"
 	sipmsg "github.com/emiago/sipgo/sip"
 	"github.com/pion/sdp/v3"
 )
@@ -22,6 +21,7 @@ import (
 //
 //	sip:trunk/callee  →  ("trunk", "callee")
 //	sip:callee        →  ("", "callee")
+//	sip://host/...    →  ("", "")        ← full URL form; caller handles separately
 func parseSIPURL(rawURL string) (trunkName, callee string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -29,7 +29,7 @@ func parseSIPURL(rawURL string) (trunkName, callee string, err error) {
 	}
 	opaque := u.Opaque
 	if opaque == "" {
-		// Hierarchical form sip://host/path — not a trunk URL; pass through to dialSIP.
+		// Hierarchical form sip://host/path — not a trunk URL; pass through to dialSIPURL.
 		return "", "", nil
 	}
 	if trunk, callee, ok := strings.Cut(opaque, "/"); ok {
@@ -39,18 +39,20 @@ func parseSIPURL(rawURL string) (trunkName, callee string, err error) {
 }
 
 // dialRegistered calls a phone that has registered with the internal SIP server.
-// It looks up the phone's contact address from the registration table.
 func dialRegistered(callee string) (*sipSession, error) {
 	v, ok := registrations.Load(callee)
 	if !ok {
 		return nil, fmt.Errorf("SIP callee %q is not registered with the internal server", callee)
 	}
-	hostPort := v.(string)
-	rawURL := fmt.Sprintf("sip://%s/%s", hostPort, callee)
-	return dialSIP(rawURL, &ThrunkConfig{})
+	host, portStr, err := net.SplitHostPort(v.(string))
+	if err != nil {
+		return nil, fmt.Errorf("invalid registration address for %q: %w", callee, err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	return dialSIP(dialParams{callee: callee, pbxHost: host, pbxPort: port})
 }
 
-// ─── Shared dial helper ─────────────────────────────────────────────────────────
+// ─── Dial helpers ─────────────────────────────────────────────────────────────
 
 // sipSession holds the result of a successful outbound SIP call setup.
 type sipSession struct {
@@ -60,44 +62,22 @@ type sipSession struct {
 	dialog     *sipgo.DialogClientSession
 }
 
-// dialSIP parses rawURL, applies pbxConf defaults for any missing host or credentials,
-// and performs the full SIP INVITE handshake. The caller owns the returned session
-// and must send BYE / close the socket when done.
-//
-// Supported URL forms:
-//
-//	sip://user:pass@host:port/callee  – all fields explicit
-//	sip:callee                        – host, port and credentials taken from pbxConf
-func dialSIP(rawURL string, trunk *ThrunkConfig) (*sipSession, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse SIP URL: %w", err)
-	}
+// dialParams holds the resolved parameters for a SIP INVITE.
+type dialParams struct {
+	callee      string
+	pbxHost     string
+	pbxPort     int
+	username    string // used for both SIP auth and From header identity
+	password    string
+	displayName string
+}
 
-	username := u.User.Username()
-	password, _ := u.User.Password()
-	pbxHost := u.Host
+// dialSIP performs the full SIP INVITE handshake using the supplied parameters.
+// The caller owns the returned session and must send BYE / close the socket when done.
+func dialSIP(p dialParams) (*sipSession, error) {
+	pbxPortStr := strconv.Itoa(p.pbxPort)
 
-	pbxIP, pbxPortStr, err := net.SplitHostPort(pbxHost)
-	if err != nil {
-		pbxIP = pbxHost
-		pbxPortStr = "5060"
-	}
-	pbxPort, _ := strconv.Atoi(pbxPortStr)
-
-	// Callee is the URL path (full form) or opaque segment (short form "sip:callee").
-	callee := strings.TrimPrefix(u.Path, "/")
-	if callee == "" {
-		callee = u.Opaque
-	}
-	if callee == "" {
-		callee = username
-	}
-	if callee == "" {
-		return nil, fmt.Errorf("SIP URL missing callee: %s", rawURL)
-	}
-
-	localIP := outboundIP(net.JoinHostPort(pbxIP, pbxPortStr))
+	localIP := outboundIP(net.JoinHostPort(p.pbxHost, pbxPortStr))
 
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
@@ -109,16 +89,16 @@ func dialSIP(rawURL string, trunk *ThrunkConfig) (*sipSession, error) {
 
 	recipient := sipmsg.Uri{
 		Scheme: "sip",
-		User:   callee,
-		Host:   pbxIP,
-		Port:   pbxPort,
+		User:   p.callee,
+		Host:   p.pbxHost,
+		Port:   p.pbxPort,
 	}
 	ct := sipmsg.ContentTypeHeader("application/sdp")
 	from := sipmsg.FromHeader{
-		DisplayName: trunk.DisplayName,
-		Address: sip.Uri{
-			User: trunk.Username,
-			Host: trunk.Host,
+		DisplayName: p.displayName,
+		Address: sipmsg.Uri{
+			User: p.username,
+			Host: p.pbxHost,
 		},
 	}
 
@@ -134,8 +114,8 @@ func dialSIP(rawURL string, trunk *ThrunkConfig) (*sipSession, error) {
 	}
 
 	if err := dialog.WaitAnswer(ctx, sipgo.AnswerOptions{
-		Username: username,
-		Password: password,
+		Username: p.username,
+		Password: p.password,
 	}); err != nil {
 		_ = udpConn.Close()
 		return nil, fmt.Errorf("wait answer: %w", err)
@@ -164,6 +144,41 @@ func dialSIP(rawURL string, trunk *ThrunkConfig) (*sipSession, error) {
 		codec:      codecs[0],
 		dialog:     dialog,
 	}, nil
+}
+
+// dialSIPURL parses a full hierarchical SIP URL (sip://user:pass@host:port/callee)
+// into dialParams and places the call. Used as a fallback for direct SIP URLs.
+func dialSIPURL(rawURL string) (*sipSession, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse SIP URL: %w", err)
+	}
+
+	username := u.User.Username()
+	password, _ := u.User.Password()
+
+	pbxHost, pbxPortStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		pbxHost = u.Host
+		pbxPortStr = "5060"
+	}
+	pbxPort, _ := strconv.Atoi(pbxPortStr)
+
+	callee := strings.TrimPrefix(u.Path, "/")
+	if callee == "" {
+		callee = username
+	}
+	if callee == "" {
+		return nil, fmt.Errorf("SIP URL missing callee: %s", rawURL)
+	}
+
+	return dialSIP(dialParams{
+		callee:   callee,
+		pbxHost:  pbxHost,
+		pbxPort:  pbxPort,
+		username: username,
+		password: password,
+	})
 }
 
 // ─── Shared SDP helpers ─────────────────────────────────────────────────────────

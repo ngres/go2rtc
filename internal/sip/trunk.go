@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/url"
 	"strconv"
 	"time"
 
@@ -17,7 +16,7 @@ const (
 	reregisterBuffer = 30  // re-register this many seconds before expiry
 )
 
-type ThrunkConfig struct {
+type TrunkConfig struct {
 	DisplayName string `yaml:"display_name" json:"display_name"`
 	Host        string `yaml:"host" json:"host"`
 	Port        int    `yaml:"port" json:"port"`
@@ -32,15 +31,13 @@ var trunks = map[string]*Trunk{}
 // It provides outbound call capability via dialVia.
 type Trunk struct {
 	name   string
-	config ThrunkConfig
+	config TrunkConfig
 
 	cancel context.CancelFunc
 }
 
-// newTrunk parses rawURL (sip:user:pass@host:port), starts the registration
-// keep-alive loop, and returns the Trunk.
-func newTrunk(name string, config ThrunkConfig) (*Trunk, error) {
-
+// newTrunk starts the registration keep-alive loop and returns the Trunk.
+func newTrunk(name string, config TrunkConfig) (*Trunk, error) {
 	t := &Trunk{
 		name:   name,
 		config: config,
@@ -89,51 +86,27 @@ func (t *Trunk) registerLoop(ctx context.Context) {
 // register sends a single REGISTER transaction, handling digest auth if
 // the server challenges with 401/407.
 func (t *Trunk) register(ctx context.Context) error {
-	// 1. Define the Registrar URI
-	recipient := sip.Uri{
-		Scheme: "sip",
-		Host:   t.config.Host,
-		// Port is usually handled by the transport/client,
-		// but can be set if using a non-standard port.
-	}
-
+	recipient := sip.Uri{Scheme: "sip", Host: t.config.Host}
 	req := sip.NewRequest(sip.REGISTER, recipient)
 
-	// 2. Define the Identity (Used for both From and To)
-	// Most registrars require From and To to be the same for REGISTER
-	identity := sip.Uri{
-		User: t.config.Username,
-		Host: t.config.Host,
-	}
+	// From and To must be the same identity for REGISTER.
+	identity := sip.Uri{User: t.config.Username, Host: t.config.Host}
+	req.AppendHeader(&sip.FromHeader{DisplayName: t.name, Address: identity})
+	req.AppendHeader(&sip.ToHeader{Address: identity})
 
-	req.AppendHeader(&sip.FromHeader{
-		DisplayName: t.name,
-		Address:     identity,
-	})
-	req.AppendHeader(&sip.ToHeader{
-		Address: identity,
-	})
-
-	// 3. Structured Contact Header
 	localIP := outboundIP(t.pbxAddr())
 	req.AppendHeader(&sip.ContactHeader{
-		Address: sip.Uri{
-			User: t.config.Username,
-			Host: localIP.String(),
-			// Port: if you want to force the listening port
-		},
+		Address: sip.Uri{User: t.config.Username, Host: localIP.String()},
 	})
 
 	tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// 5. Initial Request (using ClientRequestBuild to handle CSeq and Call-ID)
 	res, err := sipClient.Do(tctx, req, sipgo.ClientRequestBuild)
 	if err != nil {
 		return err
 	}
 
-	// 6. Handle Challenge
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		res, err = sipClient.DoDigestAuth(tctx, req, res, sipgo.DigestAuth{
 			Username: t.config.Username,
@@ -154,10 +127,12 @@ func (t *Trunk) register(ctx context.Context) error {
 // dialVia places an outbound SIP INVITE to callee through this trunk.
 // Credentials and PBX address are taken from the trunk configuration.
 func (t *Trunk) dialVia(callee string) (*sipSession, error) {
-	rawURL := fmt.Sprintf("sip://%s:%s@%s:%d/%s",
-		url.PathEscape(t.config.Username),
-		url.PathEscape(t.config.Password),
-		t.config.Host, t.config.Port, url.PathEscape(callee),
-	)
-	return dialSIP(rawURL, &t.config)
+	return dialSIP(dialParams{
+		callee:      callee,
+		pbxHost:     t.config.Host,
+		pbxPort:     t.config.Port,
+		username:    t.config.Username,
+		password:    t.config.Password,
+		displayName: t.config.DisplayName,
+	})
 }

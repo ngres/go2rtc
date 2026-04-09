@@ -40,11 +40,9 @@ var registrations sync.Map
 func Init() {
 	var conf struct {
 		Mod struct {
-			Listen   string                  `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
-			Username string                  `yaml:"username" json:"-"`
-			Password string                  `yaml:"password" json:"-"`
-			Trunks   map[string]ThrunkConfig `yaml:"trunks" json:"trunks"`
-			Routing  map[string][]string     `yaml:"routing" json:"routing"`
+			Listen  string                  `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
+			Trunks  map[string]TrunkConfig `yaml:"trunks" json:"trunks"`
+			Routing map[string][]string     `yaml:"routing" json:"routing"`
 		} `yaml:"sip"`
 	}
 
@@ -125,6 +123,10 @@ func runServer(listen string) {
 	srv.OnOptions(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 		_ = tx.Respond(sipmsg.NewResponseFromRequest(req, 200, "OK", nil))
 	})
+
+	if listen == "" {
+		return
+	}
 
 	log.Info().Str("addr", listen).Msg("[sip] listen")
 

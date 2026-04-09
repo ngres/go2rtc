@@ -102,11 +102,7 @@ func sipConsumerHandler(rawURL string) (core.Consumer, func(), error) {
 		Msg("[sip] consumer established")
 
 	// run blocks until the dialog ends; streams.Publish calls RemoveConsumer → Stop after it returns.
-	run := func() {
-		<-conn.dialog.Context().Done()
-	}
-
-	return conn, run, nil
+	return conn, func() { _ = conn.Start() }, nil
 }
 
 // dialFromURL resolves trunk name and callee from a sip: URL and places the call.
@@ -116,18 +112,17 @@ func dialFromURL(rawURL string) (*sipSession, error) {
 		return nil, err
 	}
 
-	if trunkName != "" {
+	switch {
+	case trunkName != "":
 		t, ok := trunks[trunkName]
 		if !ok {
 			return nil, fmt.Errorf("SIP trunk %q not configured", trunkName)
 		}
 		return t.dialVia(callee)
-	}
-
-	if callee != "" {
+	case callee != "":
 		return dialRegistered(callee)
+	default:
+		// Hierarchical form: sip://user:pass@host:port/callee
+		return dialSIPURL(rawURL)
 	}
-
-	// Fallback: pass the raw URL directly to dialSIP (legacy full-URL form).
-	return dialSIP(rawURL, &ThrunkConfig{})
 }
