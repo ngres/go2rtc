@@ -100,7 +100,9 @@ func dialSIP(p dialParams) (*sipSession, error) {
 			User: p.username,
 			Host: p.pbxHost,
 		},
+		Params: sipmsg.NewParams(),
 	}
+	from.Params.Add("tag", sipmsg.GenerateTagN(16))
 
 	// 30-second timeout so the caller's reconnect timer doesn't fire before we
 	// know whether the remote party answered.

@@ -40,9 +40,9 @@ var registrations sync.Map
 func Init() {
 	var conf struct {
 		Mod struct {
-			Listen  string                  `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
+			Listen  string                 `yaml:"listen" json:"listen"` // Port for the internal SIP server to listen on, e.g. ":5060". Empty to disable server mode.
 			Trunks  map[string]TrunkConfig `yaml:"trunks" json:"trunks"`
-			Routing map[string][]string     `yaml:"routing" json:"routing"`
+			Routing map[string][]string    `yaml:"routing" json:"routing"`
 		} `yaml:"sip"`
 	}
 
@@ -55,7 +55,7 @@ func Init() {
 
 	// Create the shared User Agent used for both server and client.
 	var err error
-	ua, err = sipgo.NewUA(sipgo.WithUserAgent(app.UserAgent))
+	ua, err = sipgo.NewUA(sipgo.WithUserAgent("go2rtc"))
 	if err != nil {
 		log.Error().Err(err).Msg("[sip] new UA")
 		return

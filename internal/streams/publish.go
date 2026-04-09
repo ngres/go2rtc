@@ -16,6 +16,7 @@ func (s *Stream) Publish(url string) error {
 	}
 
 	go func() {
+		// TODO: implement a return code or error channel
 		run()
 		s.RemoveConsumer(cons)
 
